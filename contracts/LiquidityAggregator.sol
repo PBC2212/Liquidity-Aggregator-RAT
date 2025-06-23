@@ -30,6 +30,10 @@ interface IUniswapV2Router {
         external view returns (uint[] memory amounts);
 }
 
+interface IRATStakingPool {
+    function addYield(uint256 usdtAmount) external;
+}
+
 contract LiquidityAggregator is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20Extended;
     
@@ -40,6 +44,11 @@ contract LiquidityAggregator is Ownable, ReentrancyGuard {
     mapping(string => address) public dexRouters;
     mapping(address => bool) public authorizedCallers; // PledgeManager, etc.
     
+    // Staking pool integration
+    IRATStakingPool public ratStakingPool;
+    bool public autoYieldEnabled = true;
+    uint256 public yieldPercentage = 5000; // 50% of acquired USDT goes to yield (5000/10000)
+    
     // Fee configuration
     uint256 public aggregatorFeePercent = 50; // 0.5% (50/10000)
     uint256 public constant MAX_FEE_PERCENT = 500; // 5% max
@@ -49,18 +58,25 @@ contract LiquidityAggregator is Ownable, ReentrancyGuard {
     uint256 public minLiquidityThreshold = 100 * 10**6; // $100 USDT minimum
     uint256 public maxSlippage = 300; // 3% (300/10000)
     
+    // Tracking
+    uint256 public totalUSDTAggregated;
+    uint256 public totalYieldProvided;
+    
     // Events
     event LiquidityAggregated(
         address indexed pledger,
         uint256 assetValue,
         uint256 usdtAcquired,
         uint256 feesTaken,
+        uint256 yieldProvided,
         string dexUsed
     );
     
+    event YieldProvidedToPool(uint256 usdtAmount);
     event DEXRouterUpdated(string dexName, address router);
     event FeeUpdated(uint256 newFeePercent);
     event SlippageUpdated(uint256 newMaxSlippage);
+    event AutoYieldConfigUpdated(bool enabled, uint256 percentage);
     
     modifier onlyAuthorized() {
         require(authorizedCallers[msg.sender], "Not authorized");
@@ -81,6 +97,17 @@ contract LiquidityAggregator is Ownable, ReentrancyGuard {
         dexRouters["uniswap"] = 0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D; // Uniswap V2
         dexRouters["sushiswap"] = 0xd9e1cE17f2641f24aE83637ab66a2cca9C378B9F; // SushiSwap
         dexRouters["pancakeswap"] = 0x10ED43C718714eb63d5aA57B78B54704E256024E; // PancakeSwap (BSC)
+    }
+    
+    function setRATStakingPool(address _stakingPool) external onlyOwner {
+        ratStakingPool = IRATStakingPool(_stakingPool);
+    }
+    
+    function setAutoYieldConfig(bool _enabled, uint256 _percentage) external onlyOwner {
+        require(_percentage <= 10000, "Percentage cannot exceed 100%");
+        autoYieldEnabled = _enabled;
+        yieldPercentage = _percentage;
+        emit AutoYieldConfigUpdated(_enabled, _percentage);
     }
     
     function addAuthorizedCaller(address caller) external onlyOwner {
@@ -134,9 +161,33 @@ contract LiquidityAggregator is Ownable, ReentrancyGuard {
             USDT.safeTransfer(feeRecipient, fees);
         }
         
-        // USDT remains in this contract for pool liquidity
+        // Calculate yield amount for staking pool
+        uint256 yieldAmount = 0;
+        if (autoYieldEnabled && address(ratStakingPool) != address(0)) {
+            yieldAmount = (netUSDT * yieldPercentage) / 10000;
+            
+            if (yieldAmount > 0) {
+                // Approve and add yield to staking pool
+                USDT.safeApprove(address(ratStakingPool), yieldAmount);
+                ratStakingPool.addYield(yieldAmount);
+                
+                totalYieldProvided += yieldAmount;
+                emit YieldProvidedToPool(yieldAmount);
+            }
+        }
         
-        emit LiquidityAggregated(pledger, assetValue, netUSDT, fees, dexUsed);
+        // Remaining USDT stays in this contract for additional liquidity
+        uint256 remainingUSDT = netUSDT - yieldAmount;
+        totalUSDTAggregated += usdtAcquired;
+        
+        emit LiquidityAggregated(
+            pledger, 
+            assetValue, 
+            usdtAcquired, 
+            fees, 
+            yieldAmount, 
+            dexUsed
+        );
     }
     
     function _aggregateLiquidity(uint256 targetUSDT) 
@@ -215,6 +266,19 @@ contract LiquidityAggregator is Ownable, ReentrancyGuard {
         return amounts[1]; // USDT amount received
     }
     
+    // Manual yield provision to staking pool
+    function provideYieldToPool(uint256 usdtAmount) external onlyOwner {
+        require(address(ratStakingPool) != address(0), "Staking pool not set");
+        require(usdtAmount > 0, "Amount must be greater than 0");
+        require(USDT.balanceOf(address(this)) >= usdtAmount, "Insufficient USDT balance");
+        
+        USDT.safeApprove(address(ratStakingPool), usdtAmount);
+        ratStakingPool.addYield(usdtAmount);
+        
+        totalYieldProvided += usdtAmount;
+        emit YieldProvidedToPool(usdtAmount);
+    }
+    
     // Function to add ETH liquidity for swapping
     function addETHLiquidity() external payable onlyOwner {
         // ETH is now available for swaps
@@ -273,6 +337,21 @@ contract LiquidityAggregator is Ownable, ReentrancyGuard {
         
         uint256[] memory amounts = uniRouter.getAmountsOut(amountIn, path);
         return amounts[1];
+    }
+    
+    // View functions for analytics
+    function getAggregatorStats() external view returns (
+        uint256 _totalUSDTAggregated,
+        uint256 _totalYieldProvided,
+        uint256 _currentUSDTBalance,
+        uint256 _yieldPercentage,
+        bool _autoYieldEnabled
+    ) {
+        _totalUSDTAggregated = totalUSDTAggregated;
+        _totalYieldProvided = totalYieldProvided;
+        _currentUSDTBalance = USDT.balanceOf(address(this));
+        _yieldPercentage = yieldPercentage;
+        _autoYieldEnabled = autoYieldEnabled;
     }
     
     // Emergency withdrawal function
