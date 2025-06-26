@@ -1,401 +1,272 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.19;
+pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
-import "@openzeppelin/contracts/security/Pausable.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-
-interface IRATToken is IERC20 {
-    function mint(address to, uint256 amount) external;
-    function burn(uint256 amount) external;
-    function burnFrom(address account, uint256 amount) external;
-}
 
 interface IERC20Extended is IERC20 {
     function decimals() external view returns (uint8);
 }
 
-interface IPledgeManager {
-    function getUserRATBalance(address user) external view returns (uint256);
-    function adminStakeRATForUser(address user, uint256 amount) external;
-    function adminUnstakeRATForUser(address user, uint256 amount) external;
-}
-
 contract RATStakingPool is Ownable, ReentrancyGuard, Pausable {
-    using SafeERC20 for IRATToken;
     using SafeERC20 for IERC20Extended;
     
-    IRATToken public immutable ratToken;
-    IERC20Extended public immutable usdt;
-    IPledgeManager public pledgeManager;
-    
-    // Staking data
     struct StakeInfo {
-        uint256 amount;           // Amount of RAT tokens staked
-        uint256 rewardDebt;       // Reward debt for yield calculation
-        uint256 lastStakeTime;    // Last time user staked
-        uint256 totalClaimed;     // Total USDT claimed by user
+        uint256 amount;
+        uint256 stakingTime;
+        uint256 lastRewardClaim;
+        uint256 accumulatedRewards;
     }
     
-    mapping(address => StakeInfo) public userStakes;
-    mapping(address => bool) public yieldProviders; // Authorized yield providers (LiquidityAggregator, etc.)
+    struct PoolInfo {
+        uint256 totalStaked;
+        uint256 totalRewards;
+        uint256 rewardPerTokenStored;
+        uint256 lastUpdateTime;
+        uint256 rewardRate; // Rewards per second
+    }
     
-    // Pool statistics
-    uint256 public totalStaked;           // Total RAT tokens staked in pool
-    uint256 public totalYieldDistributed; // Total USDT distributed as yield
-    uint256 public accUSDTPerShare;       // Accumulated USDT per share (scaled by 1e12)
-    uint256 public lastYieldTime;         // Last time yield was distributed
+    // State variables
+    IERC20Extended public immutable ratToken;
+    IERC20Extended public immutable rewardToken; // USDT
     
-    // Pool configuration
-    uint256 public minStakeAmount = 1 * 10**18;        // Minimum 1 RAT to stake
-    uint256 public unstakeLockPeriod = 7 days;         // 7 days lock period for unstaking
-    uint256 public yieldDistributionFee = 200;         // 2% fee on yield distribution (200/10000)
-    uint256 public constant MAX_FEE = 1000;            // Max 10% fee
-    address public feeRecipient;
+    PoolInfo public poolInfo;
+    mapping(address => StakeInfo) public stakes;
+    mapping(address => uint256) public userRewardPerTokenPaid;
     
-    // Yield sources
-    uint256 public pendingYieldUSDT;      // USDT waiting to be distributed
-    uint256 public yieldDistributionRate = 100;  // Percentage of pending yield to distribute per day (10000 = 100%)
+    uint256 public constant MIN_STAKE_AMOUNT = 100 * 10**18; // 100 RAT tokens
+    uint256 public constant MIN_STAKE_DURATION = 7 days;
+    uint256 public constant EARLY_UNSTAKE_PENALTY = 1000; // 10% in basis points
     
     // Events
-    event Staked(address indexed user, uint256 amount, uint256 totalStaked);
-    event Unstaked(address indexed user, uint256 amount, uint256 totalStaked);
-    event YieldClaimed(address indexed user, uint256 usdtAmount);
-    event YieldDistributed(uint256 usdtAmount, uint256 newAccUSDTPerShare);
-    event YieldAdded(address indexed provider, uint256 usdtAmount);
-    event EmergencyWithdraw(address indexed user, uint256 ratAmount);
-    
-    modifier onlyYieldProvider() {
-        require(yieldProviders[msg.sender], "Not authorized yield provider");
-        _;
-    }
+    event Staked(address indexed user, uint256 amount, uint256 timestamp);
+    event Unstaked(address indexed user, uint256 amount, uint256 penalty);
+    event RewardsClaimed(address indexed user, uint256 amount);
+    event YieldAdded(uint256 amount, address indexed contributor);
+    event RewardRateUpdated(uint256 newRate);
     
     constructor(
         address _ratToken,
-        address _usdt,
-        address _feeRecipient
-    ) {
-        ratToken = IRATToken(_ratToken);
-        usdt = IERC20Extended(_usdt);
-        feeRecipient = _feeRecipient;
-        lastYieldTime = block.timestamp;
+        address _rewardToken,
+        address initialOwner
+    ) Ownable(initialOwner) {
+        require(_ratToken != address(0), "Invalid RAT token address");
+        require(_rewardToken != address(0), "Invalid reward token address");
         
-        // Set owner as initial yield provider
-        yieldProviders[msg.sender] = true;
-    }
-    
-    function setPledgeManager(address _pledgeManager) external onlyOwner {
-        pledgeManager = IPledgeManager(_pledgeManager);
-    }
-    
-    function addYieldProvider(address provider) external onlyOwner {
-        yieldProviders[provider] = true;
-    }
-    
-    function removeYieldProvider(address provider) external onlyOwner {
-        yieldProviders[provider] = false;
-    }
-    
-    function setYieldDistributionFee(uint256 _fee) external onlyOwner {
-        require(_fee <= MAX_FEE, "Fee too high");
-        yieldDistributionFee = _fee;
-    }
-    
-    function setYieldDistributionRate(uint256 _rate) external onlyOwner {
-        require(_rate <= 10000, "Rate cannot exceed 100%");
-        yieldDistributionRate = _rate;
-    }
-    
-    function setMinStakeAmount(uint256 _amount) external onlyOwner {
-        minStakeAmount = _amount;
-    }
-    
-    function setUnstakeLockPeriod(uint256 _period) external onlyOwner {
-        require(_period <= 30 days, "Lock period too long");
-        unstakeLockPeriod = _period;
-    }
-    
-    // Stake RAT tokens directly (if user has RAT tokens)
-    function stakeRAT(uint256 amount) external whenNotPaused nonReentrant {
-        require(amount >= minStakeAmount, "Amount below minimum");
+        ratToken = IERC20Extended(_ratToken);
+        rewardToken = IERC20Extended(_rewardToken);
         
-        _distributeYield();
+        poolInfo.lastUpdateTime = block.timestamp;
+        poolInfo.rewardRate = 1 * 10**18; // 1 USDT per second initially
+    }
+    
+    modifier updateReward(address account) {
+        poolInfo.rewardPerTokenStored = rewardPerToken();
+        poolInfo.lastUpdateTime = block.timestamp;
         
-        StakeInfo storage user = userStakes[msg.sender];
-        
-        // Update user's reward debt
-        if (user.amount > 0) {
-            uint256 pending = (user.amount * accUSDTPerShare) / 1e12 - user.rewardDebt;
-            if (pending > 0) {
-                usdt.safeTransfer(msg.sender, pending);
-                user.totalClaimed += pending;
-                emit YieldClaimed(msg.sender, pending);
-            }
+        if (account != address(0)) {
+            stakes[account].accumulatedRewards = earned(account);
+            userRewardPerTokenPaid[account] = poolInfo.rewardPerTokenStored;
         }
+        _;
+    }
+    
+    /**
+     * @dev Stake RAT tokens
+     * @param amount Amount of RAT tokens to stake
+     */
+    function stake(uint256 amount) external whenNotPaused nonReentrant updateReward(msg.sender) {
+        require(amount >= MIN_STAKE_AMOUNT, "Amount below minimum stake");
         
-        // Transfer RAT tokens from user
         ratToken.safeTransferFrom(msg.sender, address(this), amount);
         
-        // Update staking info
-        user.amount += amount;
-        user.lastStakeTime = block.timestamp;
-        user.rewardDebt = (user.amount * accUSDTPerShare) / 1e12;
+        stakes[msg.sender].amount += amount;
+        stakes[msg.sender].stakingTime = block.timestamp;
+        stakes[msg.sender].lastRewardClaim = block.timestamp;
         
-        totalStaked += amount;
+        poolInfo.totalStaked += amount;
         
-        emit Staked(msg.sender, amount, user.amount);
+        emit Staked(msg.sender, amount, block.timestamp);
     }
     
-    // Admin function to stake RAT from custody on behalf of user
-    function adminStakeForUser(address user, uint256 amount) external onlyOwner whenNotPaused {
-        require(amount >= minStakeAmount, "Amount below minimum");
-        require(address(pledgeManager) != address(0), "PledgeManager not set");
+    /**
+     * @dev Unstake RAT tokens
+     * @param amount Amount of RAT tokens to unstake
+     */
+    function unstake(uint256 amount) external nonReentrant updateReward(msg.sender) {
+        require(amount > 0, "Amount must be greater than 0");
+        require(stakes[msg.sender].amount >= amount, "Insufficient staked amount");
         
-        _distributeYield();
+        uint256 penalty = 0;
+        uint256 stakingDuration = block.timestamp - stakes[msg.sender].stakingTime;
         
-        // Use PledgeManager to transfer RAT from custody
-        pledgeManager.adminStakeRATForUser(user, amount);
-        
-        StakeInfo storage userStake = userStakes[user];
-        
-        // Update user's reward debt
-        if (userStake.amount > 0) {
-            uint256 pending = (userStake.amount * accUSDTPerShare) / 1e12 - userStake.rewardDebt;
-            if (pending > 0) {
-                usdt.safeTransfer(user, pending);
-                userStake.totalClaimed += pending;
-                emit YieldClaimed(user, pending);
-            }
+        // Apply early unstaking penalty if staked for less than minimum duration
+        if (stakingDuration < MIN_STAKE_DURATION) {
+            penalty = (amount * EARLY_UNSTAKE_PENALTY) / 10000;
         }
         
-        // Update staking info
-        userStake.amount += amount;
-        userStake.lastStakeTime = block.timestamp;
-        userStake.rewardDebt = (userStake.amount * accUSDTPerShare) / 1e12;
+        uint256 amountToReturn = amount - penalty;
         
-        totalStaked += amount;
+        stakes[msg.sender].amount -= amount;
+        poolInfo.totalStaked -= amount;
         
-        emit Staked(user, amount, userStake.amount);
+        // Transfer tokens back to user
+        ratToken.safeTransfer(msg.sender, amountToReturn);
+        
+        // If there's a penalty, keep it in the contract (or send to treasury)
+        if (penalty > 0) {
+            // Penalty stays in contract and can be used for additional rewards
+            poolInfo.totalRewards += penalty;
+        }
+        
+        emit Unstaked(msg.sender, amountToReturn, penalty);
     }
     
-    // Unstake RAT tokens
-    function unstakeRAT(uint256 amount) external nonReentrant {
-        StakeInfo storage user = userStakes[msg.sender];
-        require(user.amount >= amount, "Insufficient staked amount");
-        require(
-            block.timestamp >= user.lastStakeTime + unstakeLockPeriod, 
-            "Unstake lock period not passed"
+    /**
+     * @dev Claim accumulated rewards
+     */
+    function claimRewards() external nonReentrant updateReward(msg.sender) {
+        uint256 reward = stakes[msg.sender].accumulatedRewards;
+        require(reward > 0, "No rewards to claim");
+        
+        stakes[msg.sender].accumulatedRewards = 0;
+        stakes[msg.sender].lastRewardClaim = block.timestamp;
+        
+        rewardToken.safeTransfer(msg.sender, reward);
+        
+        emit RewardsClaimed(msg.sender, reward);
+    }
+    
+    /**
+     * @dev Add yield to the pool (called by LiquidityAggregator)
+     * @param amount Amount of USDT to add as yield
+     */
+    function addYield(uint256 amount) external {
+        require(amount > 0, "Amount must be greater than 0");
+        
+        rewardToken.safeTransferFrom(msg.sender, address(this), amount);
+        poolInfo.totalRewards += amount;
+        
+        // Increase reward rate based on the yield added
+        if (poolInfo.totalStaked > 0) {
+            uint256 additionalRate = amount / (7 days); // Distribute over 7 days
+            poolInfo.rewardRate += additionalRate;
+        }
+        
+        emit YieldAdded(amount, msg.sender);
+    }
+    
+    /**
+     * @dev Set reward rate (admin only)
+     * @param _rewardRate New reward rate (rewards per second)
+     */
+    function setRewardRate(uint256 _rewardRate) external onlyOwner updateReward(address(0)) {
+        poolInfo.rewardRate = _rewardRate;
+        emit RewardRateUpdated(_rewardRate);
+    }
+    
+    /**
+     * @dev Calculate reward per token
+     */
+    function rewardPerToken() public view returns (uint256) {
+        if (poolInfo.totalStaked == 0) {
+            return poolInfo.rewardPerTokenStored;
+        }
+        
+        return poolInfo.rewardPerTokenStored + 
+            (((block.timestamp - poolInfo.lastUpdateTime) * poolInfo.rewardRate * 1e18) / poolInfo.totalStaked);
+    }
+    
+    /**
+     * @dev Calculate earned rewards for an account
+     * @param account Address of the account
+     */
+    function earned(address account) public view returns (uint256) {
+        return (stakes[account].amount * 
+            (rewardPerToken() - userRewardPerTokenPaid[account]) / 1e18) + 
+            stakes[account].accumulatedRewards;
+    }
+    
+    /**
+     * @dev Get staking information for an account
+     * @param account Address of the account
+     */
+    function getStakeInfo(address account) external view returns (
+        uint256 stakedAmount,
+        uint256 stakingTime,
+        uint256 stakingDuration,
+        uint256 earnedRewards,
+        bool canUnstakeWithoutPenalty
+    ) {
+        StakeInfo memory stakeInfo = stakes[account];
+        uint256 duration = block.timestamp - stakeInfo.stakingTime;
+        bool noPenalty = duration >= MIN_STAKE_DURATION;
+        
+        return (
+            stakeInfo.amount,
+            stakeInfo.stakingTime,
+            duration,
+            earned(account),
+            noPenalty
         );
-        
-        _distributeYield();
-        
-        // Calculate and send pending rewards
-        uint256 pending = (user.amount * accUSDTPerShare) / 1e12 - user.rewardDebt;
-        if (pending > 0) {
-            usdt.safeTransfer(msg.sender, pending);
-            user.totalClaimed += pending;
-            emit YieldClaimed(msg.sender, pending);
-        }
-        
-        // Update staking info
-        user.amount -= amount;
-        user.rewardDebt = (user.amount * accUSDTPerShare) / 1e12;
-        
-        totalStaked -= amount;
-        
-        // Transfer RAT tokens back to user
-        ratToken.safeTransfer(msg.sender, amount);
-        
-        emit Unstaked(msg.sender, amount, user.amount);
     }
     
-    // Claim accumulated USDT rewards
-    function claimRewards() external nonReentrant {
-        _distributeYield();
-        
-        StakeInfo storage user = userStakes[msg.sender];
-        uint256 pending = (user.amount * accUSDTPerShare) / 1e12 - user.rewardDebt;
-        
-        require(pending > 0, "No pending rewards");
-        
-        user.rewardDebt = (user.amount * accUSDTPerShare) / 1e12;
-        user.totalClaimed += pending;
-        
-        usdt.safeTransfer(msg.sender, pending);
-        
-        emit YieldClaimed(msg.sender, pending);
+    /**
+     * @dev Get pool statistics
+     */
+    function getPoolStats() external view returns (
+        uint256 totalStaked,
+        uint256 totalRewards,
+        uint256 currentRewardRate,
+        uint256 totalStakers
+    ) {
+        // Note: totalStakers would require additional tracking
+        return (
+            poolInfo.totalStaked,
+            poolInfo.totalRewards,
+            poolInfo.rewardRate,
+            0 // Placeholder for total stakers
+        );
     }
     
-    // Add USDT yield to the pool (called by LiquidityAggregator or admin)
-    function addYield(uint256 usdtAmount) external onlyYieldProvider {
-        require(usdtAmount > 0, "Amount must be greater than 0");
+    /**
+     * @dev Calculate early unstaking penalty for an amount
+     * @param account Address of the account
+     * @param amount Amount to potentially unstake
+     */
+    function calculatePenalty(address account, uint256 amount) external view returns (uint256) {
+        uint256 stakingDuration = block.timestamp - stakes[account].stakingTime;
         
-        usdt.safeTransferFrom(msg.sender, address(this), usdtAmount);
-        
-        // Take fee
-        uint256 fee = (usdtAmount * yieldDistributionFee) / 10000;
-        if (fee > 0 && feeRecipient != address(0)) {
-            usdt.safeTransfer(feeRecipient, fee);
-        }
-        
-        uint256 netYield = usdtAmount - fee;
-        pendingYieldUSDT += netYield;
-        
-        emit YieldAdded(msg.sender, netYield);
-        
-        // Optionally auto-distribute yield
-        _distributeYield();
-    }
-    
-    // Internal function to distribute pending yield
-    function _distributeYield() internal {
-        if (totalStaked == 0 || pendingYieldUSDT == 0) {
-            return;
-        }
-        
-        // Calculate how much yield to distribute based on time elapsed and rate
-        uint256 timeSinceLastDistribution = block.timestamp - lastYieldTime;
-        uint256 dailyDistribution = (pendingYieldUSDT * yieldDistributionRate) / 10000;
-        uint256 timeBasedDistribution = (dailyDistribution * timeSinceLastDistribution) / 1 days;
-        
-        // Don't distribute more than available
-        uint256 toDistribute = timeBasedDistribution > pendingYieldUSDT ? 
-            pendingYieldUSDT : timeBasedDistribution;
-        
-        if (toDistribute > 0) {
-            // Update accumulated USDT per share
-            accUSDTPerShare += (toDistribute * 1e12) / totalStaked;
-            
-            // Update state
-            pendingYieldUSDT -= toDistribute;
-            totalYieldDistributed += toDistribute;
-            lastYieldTime = block.timestamp;
-            
-            emit YieldDistributed(toDistribute, accUSDTPerShare);
-        }
-    }
-    
-    // Manual yield distribution (admin function)
-    function distributeYield() external onlyOwner {
-        _distributeYield();
-    }
-    
-    // Force distribute all pending yield
-    function forceDistributeAllYield() external onlyOwner {
-        require(totalStaked > 0, "No stakers");
-        require(pendingYieldUSDT > 0, "No pending yield");
-        
-        uint256 toDistribute = pendingYieldUSDT;
-        
-        // Update accumulated USDT per share
-        accUSDTPerShare += (toDistribute * 1e12) / totalStaked;
-        
-        // Update state
-        pendingYieldUSDT = 0;
-        totalYieldDistributed += toDistribute;
-        lastYieldTime = block.timestamp;
-        
-        emit YieldDistributed(toDistribute, accUSDTPerShare);
-    }
-    
-    // View functions
-    function pendingRewards(address user) external view returns (uint256) {
-        StakeInfo memory userStake = userStakes[user];
-        if (userStake.amount == 0) {
+        if (stakingDuration >= MIN_STAKE_DURATION) {
             return 0;
         }
         
-        uint256 currentAccUSDTPerShare = accUSDTPerShare;
-        
-        // Calculate additional yield that would be distributed
-        if (totalStaked > 0 && pendingYieldUSDT > 0) {
-            uint256 timeSinceLastDistribution = block.timestamp - lastYieldTime;
-            uint256 dailyDistribution = (pendingYieldUSDT * yieldDistributionRate) / 10000;
-            uint256 timeBasedDistribution = (dailyDistribution * timeSinceLastDistribution) / 1 days;
-            uint256 toDistribute = timeBasedDistribution > pendingYieldUSDT ? 
-                pendingYieldUSDT : timeBasedDistribution;
-            
-            if (toDistribute > 0) {
-                currentAccUSDTPerShare += (toDistribute * 1e12) / totalStaked;
-            }
-        }
-        
-        return (userStake.amount * currentAccUSDTPerShare) / 1e12 - userStake.rewardDebt;
+        return (amount * EARLY_UNSTAKE_PENALTY) / 10000;
     }
     
-    function getUserStakeInfo(address user) external view returns (
-        uint256 stakedAmount,
-        uint256 pendingUSDT,
-        uint256 totalClaimedUSDT,
-        uint256 lastStakeTime,
-        bool canUnstake
-    ) {
-        StakeInfo memory userStake = userStakes[user];
-        stakedAmount = userStake.amount;
-        pendingUSDT = this.pendingRewards(user);
-        totalClaimedUSDT = userStake.totalClaimed;
-        lastStakeTime = userStake.lastStakeTime;
-        canUnstake = block.timestamp >= userStake.lastStakeTime + unstakeLockPeriod;
-    }
-    
-    function getPoolStats() external view returns (
-        uint256 _totalStaked,
-        uint256 _totalYieldDistributed,
-        uint256 _pendingYieldUSDT,
-        uint256 _currentAPY,
-        uint256 _poolUSDTBalance
-    ) {
-        _totalStaked = totalStaked;
-        _totalYieldDistributed = totalYieldDistributed;
-        _pendingYieldUSDT = pendingYieldUSDT;
-        _poolUSDTBalance = usdt.balanceOf(address(this));
-        
-        // Calculate approximate APY based on recent yield
-        if (_totalStaked > 0 && _totalYieldDistributed > 0) {
-            // Simple APY calculation (this could be more sophisticated)
-            uint256 timeOperating = block.timestamp - (block.timestamp - 365 days); // Placeholder
-            if (timeOperating > 0) {
-                _currentAPY = (_totalYieldDistributed * 365 days * 10000) / (_totalStaked * timeOperating);
-            }
-        }
-    }
-    
-    // Emergency functions
-    function emergencyWithdraw() external nonReentrant {
-        StakeInfo storage user = userStakes[msg.sender];
-        require(user.amount > 0, "No staked amount");
-        
-        uint256 amount = user.amount;
-        
-        // Reset user stake (forfeit rewards in emergency)
-        user.amount = 0;
-        user.rewardDebt = 0;
-        totalStaked -= amount;
-        
-        // Transfer RAT tokens back to user
-        ratToken.safeTransfer(msg.sender, amount);
-        
-        emit EmergencyWithdraw(msg.sender, amount);
-    }
-    
+    /**
+     * @dev Pause the contract (admin only)
+     */
     function pause() external onlyOwner {
         _pause();
     }
     
+    /**
+     * @dev Unpause the contract (admin only)
+     */
     function unpause() external onlyOwner {
         _unpause();
     }
     
-    // Admin emergency withdrawal
-    function emergencyWithdrawAdmin(address token, uint256 amount) external onlyOwner {
-        if (token == address(0)) {
-            payable(owner()).transfer(amount);
-        } else {
-            IERC20(token).transfer(owner(), amount);
-        }
+    /**
+     * @dev Emergency withdrawal function (admin only)
+     * @param token Token to withdraw
+     * @param amount Amount to withdraw
+     */
+    function emergencyWithdraw(address token, uint256 amount) external onlyOwner {
+        IERC20Extended(token).safeTransfer(owner(), amount);
     }
-    
-    receive() external payable {}
 }

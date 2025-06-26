@@ -1,0 +1,35 @@
+{
+  "name": "rat-protocol-nodejs",
+  "version": "1.0.0",
+  "description": "Node.js implementation for RAT Protocol management",
+  "main": "rat-protocol-manager.js",
+  "scripts": {
+    "test": "node test-basic.js",
+    "start": "node rat-protocol-manager.js",
+    "dev": "nodemon rat-protocol-manager.js"
+  },
+  "dependencies": {
+    "axios": "^1.10.0",
+    "chalk": "^4.1.2",
+    "dotenv": "^16.5.0",
+    "ethers": "^6.14.4",
+    "express": "^4.21.2",
+    "inquirer": "^8.2.6",
+    "moment": "^2.30.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.10"
+  },
+  "keywords": [
+    "blockchain",
+    "defi",
+    "real-assets",
+    "ethereum",
+    "rat-protocol"
+  ],
+  "author": "RAT Protocol Team",
+  "license": "MIT",
+  "directories": {
+    "example": "examples"
+  }
+}
